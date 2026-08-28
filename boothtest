@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+Headless Thermal Printer Photobooth
+Based on reference architecture by digiiash
+"""
+
+import os
+import time
+import subprocess
+import RPi.GPIO as GPIO
+from PIL import Image, ImageDraw, ImageFont
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+SHUTTER_PIN    = 17          # GPIO pin for shutter button (active LOW, BCM numbering)
+SHUTDOWN_PIN   = 26          # Optional GPIO pin for shutdown button (set None to disable)
+COOLDOWN_SECS  = 5           # Lockout time to prevent duplicate snaps
+PRINTER_NAME   = "ZJ-58"     # CUPS printer queue name
+
+RAW_PHOTO      = "/tmp/raw_photo.jpg"
+PRINT_READY    = "/tmp/print_photo.png"
+
+# Text rendered underneath every photo
+CAPTION_TEXT   = "Nexus Artineers"
+FONT_SIZE      = 32
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def setup_gpio():
+    """Configure shutter and shutdown pins as inputs with pull-ups."""
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(SHUTTER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    if SHUTDOWN_PIN is not None:
+        GPIO.setup(SHUTDOWN_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+
+def add_caption(image_path, text, output_path):
+    """Adds a white banner and centered text underneath the snapshot."""
+    with Image.open(image_path) as img:
+        img = img.convert("RGB")
+        width, height = img.size
+
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", FONT_SIZE)
+        except OSError:
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/freefont/FreeSansBold.ttf", FONT_SIZE)
+            except OSError:
+                font = ImageFont.load_default()
+
+        bbox = font.getbbox(text)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+
+        banner_height = text_h + 30
+        new_img = Image.new("RGB", (width, height + banner_height), "white")
+        new_img.paste(img, (0, 0))
+
+        draw = ImageDraw.Draw(new_img)
+        text_x = (width - text_w) // 2
+        text_y = height + (banner_height - text_h) // 2 - 5
+        draw.text((text_x, text_y), text, fill="black", font=font)
+
+        # Convert to 1-bit dithered image for clean thermal printing
+        dithered_img = new_img.convert("1")
+        dithered_img.save(output_path, "PNG")
+
+
+def take_and_print():
+    """Capture still, composite the banner, and spool to CUPS lp."""
+    print("Capturing photo...")
+    capture_cmd = [
+        "rpicam-still",
+        "-o", RAW_PHOTO,
+        "-t", "500",
+        "--width", "512",
+        "--height", "512",
+        "-n"
+    ]
+
+    try:
+        subprocess.run(capture_cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Capture failed: {e}")
+        return
+
+    add_caption(RAW_PHOTO, CAPTION_TEXT, PRINT_READY)
+
+    print("Sending to thermal printer...")
+    print_cmd = ["lp", "-o", "fit-to-page"]
+    if PRINTER_NAME:
+        print_cmd.extend(["-d", PRINTER_NAME])
+    print_cmd.append(PRINT_READY)
+
+    try:
+        subprocess.run(print_cmd, check=True)
+        print("Print job queued successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Print failed: {e}")
+
+
+def main():
+    setup_gpio()
+    print("Photobooth ready — waiting for shutter button press.")
+
+    try:
+        while True:
+            # ── Shutter button ────────────────────────────────────────────
+            if GPIO.input(SHUTTER_PIN) == GPIO.LOW:
+                # Wait for physical release (debounce)
+                while GPIO.input(SHUTTER_PIN) == GPIO.LOW:
+                    time.sleep(0.05)
+
+                take_and_print()
+
+                # Lockout cooldown
+                print(f"Lockout active: waiting {COOLDOWN_SECS} seconds...")
+                time.sleep(COOLDOWN_SECS)
+                print("Ready for next photo.")
+
+            # ── Shutdown button ───────────────────────────────────────────
+            if SHUTDOWN_PIN is not None and GPIO.input(SHUTDOWN_PIN) == GPIO.LOW:
+                while GPIO.input(SHUTDOWN_PIN) == GPIO.LOW:
+                    time.sleep(0.05)
+                print("Shutdown triggered.")
+                time.sleep(1)
+                subprocess.call(["sudo", "shutdown", "now"])
+
+            time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        print("\nExiting.")
+    finally:
+        GPIO.cleanup()
+
+
+if __name__ == "__main__":
+    main()
